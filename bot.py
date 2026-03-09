@@ -15,11 +15,13 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    LabeledPrice,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -29,8 +31,10 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    PreCheckoutQueryHandler,
     filters,
 )
+
 from google import genai
 
 
@@ -63,19 +67,30 @@ SYSTEM_PROMPT = os.getenv(
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 ADMIN_ID = os.getenv("ADMIN_ID")
 
-# Антиспам
+# антиспам
 MIN_SECONDS_BETWEEN_AI_REQUESTS = float(os.getenv("MIN_SECONDS_BETWEEN_AI_REQUESTS", "2"))
 MIN_SECONDS_BETWEEN_USER_MESSAGES = float(os.getenv("MIN_SECONDS_BETWEEN_USER_MESSAGES", "2"))
 
-# Дневные лимиты
-DAILY_TEXT_LIMIT = int(os.getenv("DAILY_TEXT_LIMIT", "25"))
-DAILY_VOICE_LIMIT = int(os.getenv("DAILY_VOICE_LIMIT", "8"))
-DAILY_IMAGE_LIMIT = int(os.getenv("DAILY_IMAGE_LIMIT", "10"))
-DAILY_FILE_LIMIT = int(os.getenv("DAILY_FILE_LIMIT", "6"))
+# free лимиты
+FREE_TEXT_LIMIT = int(os.getenv("FREE_TEXT_LIMIT", "60"))
+FREE_VOICE_LIMIT = int(os.getenv("FREE_VOICE_LIMIT", "8"))
+FREE_IMAGE_LIMIT = int(os.getenv("FREE_IMAGE_LIMIT", "8"))
+FREE_FILE_LIMIT = int(os.getenv("FREE_FILE_LIMIT", "5"))
 
-# Кэш
+# pro лимиты
+PRO_TEXT_LIMIT = int(os.getenv("PRO_TEXT_LIMIT", "999999"))
+PRO_VOICE_LIMIT = int(os.getenv("PRO_VOICE_LIMIT", "25"))
+PRO_IMAGE_LIMIT = int(os.getenv("PRO_IMAGE_LIMIT", "25"))
+PRO_FILE_LIMIT = int(os.getenv("PRO_FILE_LIMIT", "15"))
+
+# кэш
 ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))  # 6 часов
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))
+
+# stars подписка
+PRO_PLAN_NAME = "pro"
+PRO_PRICE_STARS = int(os.getenv("PRO_PRICE_STARS", "199"))
+PRO_DURATION_DAYS = int(os.getenv("PRO_DURATION_DAYS", "30"))
 
 if not TELEGRAM_TOKEN:
     raise ValueError("Не найден TELEGRAM_TOKEN")
@@ -95,6 +110,24 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 last_ai_request_time = 0.0
 ai_request_lock = asyncio.Lock()
 user_cooldowns: dict[int, float] = {}
+
+
+# =========================
+# LIMIT PLANS
+# =========================
+FREE_LIMITS = {
+    "text": FREE_TEXT_LIMIT,
+    "voice": FREE_VOICE_LIMIT,
+    "image": FREE_IMAGE_LIMIT,
+    "file": FREE_FILE_LIMIT,
+}
+
+PRO_LIMITS = {
+    "text": PRO_TEXT_LIMIT,
+    "voice": PRO_VOICE_LIMIT,
+    "image": PRO_IMAGE_LIMIT,
+    "file": PRO_FILE_LIMIT,
+}
 
 
 # =========================
@@ -134,8 +167,10 @@ async def wait_for_rate_limit():
     async with ai_request_lock:
         now = time.monotonic()
         diff = now - last_ai_request_time
+
         if diff < MIN_SECONDS_BETWEEN_AI_REQUESTS:
             await asyncio.sleep(MIN_SECONDS_BETWEEN_AI_REQUESTS - diff)
+
         last_ai_request_time = time.monotonic()
 
 
@@ -214,6 +249,15 @@ def init_db():
         cache_key TEXT NOT NULL UNIQUE,
         response_text TEXT NOT NULL,
         created_at INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_subscriptions (
+        chat_id TEXT PRIMARY KEY,
+        plan_name TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -374,6 +418,65 @@ def clear_all_messages():
 
 
 # =========================
+# SUBSCRIPTIONS
+# =========================
+def get_subscription(chat_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT plan_name, expires_at
+    FROM user_subscriptions
+    WHERE chat_id = ?
+    """, (chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def set_subscription(chat_id: str, plan_name: str, expires_at: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO user_subscriptions (chat_id, plan_name, expires_at, updated_at)
+    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(chat_id) DO UPDATE SET
+        plan_name=excluded.plan_name,
+        expires_at=excluded.expires_at,
+        updated_at=CURRENT_TIMESTAMP
+    """, (chat_id, plan_name, expires_at))
+    conn.commit()
+    conn.close()
+
+
+def has_active_pro(chat_id: str) -> bool:
+    row = get_subscription(chat_id)
+    if not row:
+        return False
+    return row["plan_name"] == PRO_PLAN_NAME and int(row["expires_at"]) > int(time.time())
+
+
+def is_unlimited_user(user_id: int, chat_id: str) -> bool:
+    if is_admin(user_id):
+        return True
+    return has_active_pro(chat_id)
+
+
+def get_user_limits(user_id: int, chat_id: str) -> dict:
+    if is_admin(user_id):
+        return {
+            "text": 999999,
+            "voice": 999999,
+            "image": 999999,
+            "file": 999999,
+        }
+
+    if has_active_pro(chat_id):
+        return PRO_LIMITS
+
+    return FREE_LIMITS
+
+
+# =========================
 # USAGE LIMITS
 # =========================
 def get_usage_count(chat_id: str, kind: str) -> int:
@@ -402,19 +505,10 @@ def increment_usage(chat_id: str, kind: str):
     conn.close()
 
 
-def get_limit_for_kind(kind: str) -> int:
-    limits = {
-        "text": DAILY_TEXT_LIMIT,
-        "voice": DAILY_VOICE_LIMIT,
-        "image": DAILY_IMAGE_LIMIT,
-        "file": DAILY_FILE_LIMIT,
-    }
-    return limits.get(kind, DAILY_TEXT_LIMIT)
-
-
-def check_daily_limit(chat_id: str, kind: str) -> tuple[bool, int, int]:
+def check_daily_limit(chat_id: str, user_id: int, kind: str) -> tuple[bool, int, int]:
+    limits = get_user_limits(user_id, chat_id)
     used = get_usage_count(chat_id, kind)
-    limit = get_limit_for_kind(kind)
+    limit = limits.get(kind, 0)
     return used < limit, used, limit
 
 
@@ -523,7 +617,7 @@ def quick_answer(chat_id: str, user_text: str) -> str | None:
     if text in {"привет", "ку", "здарова", "здравствуйте", "добрый день"}:
         return "Привет! Чем могу помочь?"
 
-    if text in {"как дела", "как настроение"}:
+    if text in {"как дела", "как настроение", "как насроения"}:
         return "Всё хорошо 🙂 Чем помочь?"
 
     if text in {"что ты умеешь", "что ты можешь"}:
@@ -662,19 +756,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- читать PDF/TXT\n"
         "- генерировать картинки\n\n"
         "Команды:\n"
-        "/start\n/help\n/clear\n/me\n/remember текст\n/mode assistant|coder|translator|teacher\n/image описание"
+        "/start\n/help\n/clear\n/me\n/remember текст\n"
+        "/mode assistant|coder|translator|teacher\n"
+        "/image описание\n"
+        "/upgrade — купить PRO\n"
+        "/pro — статус подписки"
     )
     await update.message.reply_text(text, reply_markup=main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Просто пиши сообщения. Также доступны:\n"
+        "Просто пиши сообщения.\n\n"
         "/remember — сохранить факт о себе\n"
         "/me — показать сохранённую память\n"
         "/clear — очистить историю\n"
         "/mode — сменить режим\n"
-        "/image — сделать картинку\n\n"
+        "/image — сделать картинку\n"
+        "/upgrade — купить PRO\n"
+        "/pro — статус подписки\n\n"
         "Админу доступна /admin",
         reply_markup=main_keyboard()
     )
@@ -695,11 +795,19 @@ async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     username = f"@{user['username']}" if user["username"] else "-"
+    sub = get_subscription(chat_id)
+
+    sub_text = "FREE"
+    if sub and int(sub["expires_at"]) > int(time.time()):
+        expire_date = datetime.fromtimestamp(int(sub["expires_at"])).strftime("%d.%m.%Y %H:%M")
+        sub_text = f"{sub['plan_name']} до {expire_date}"
+
     text = (
         f"Имя: {user['first_name'] or '-'}\n"
         f"Username: {username}\n"
         f"Язык: {user['language_code'] or '-'}\n"
-        f"Режим: {user['mode'] or 'assistant'}\n\n"
+        f"Режим: {user['mode'] or 'assistant'}\n"
+        f"Тариф: {sub_text}\n\n"
         f"Память:\n{user['memory_notes'] or 'Пока пусто'}"
     )
     await update.message.reply_text(text)
@@ -738,14 +846,98 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Режим переключён на: {new_mode}")
 
 
+async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_id = update.effective_user.id
+
+    if is_admin(user_id):
+        await update.message.reply_text("👑 Ты админ. Для тебя все лимиты отключены.")
+        return
+
+    sub = get_subscription(chat_id)
+    if sub and int(sub["expires_at"]) > int(time.time()):
+        expire_date = datetime.fromtimestamp(int(sub["expires_at"])).strftime("%d.%m.%Y %H:%M")
+        await update.message.reply_text(
+            f"⭐ PRO активен\n"
+            f"Тариф: {sub['plan_name']}\n"
+            f"До: {expire_date}"
+        )
+        return
+
+    await update.message.reply_text(
+        f"У тебя сейчас FREE.\n\n"
+        f"PRO: {PRO_PRICE_STARS} ⭐ на {PRO_DURATION_DAYS} дней\n"
+        f"Команда: /upgrade"
+    )
+
+
+async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prices = [LabeledPrice(f"PRO на {PRO_DURATION_DAYS} дней", PRO_PRICE_STARS)]
+
+    await update.message.reply_invoice(
+        title="AI Bot PRO",
+        description=(
+            f"⭐ PRO подписка на {PRO_DURATION_DAYS} дней\n\n"
+            f"• без лимита на текст\n"
+            f"• {PRO_IMAGE_LIMIT} картинок в день\n"
+            f"• {PRO_VOICE_LIMIT} голосовых в день\n"
+            f"• {PRO_FILE_LIMIT} файлов в день\n"
+            f"• приоритетный доступ"
+        ),
+        payload="pro_30_days",
+        currency="XTR",
+        prices=prices,
+        provider_token="",
+        start_parameter="pro-subscription",
+    )
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+
+    if query.invoice_payload != "pro_30_days":
+        await query.answer(ok=False, error_message="Неизвестный платёж.")
+        return
+
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.message.successful_payment
+    chat_id = str(update.effective_chat.id)
+
+    if payment.invoice_payload != "pro_30_days":
+        return
+
+    now_ts = int(time.time())
+    current_sub = get_subscription(chat_id)
+
+    if current_sub and int(current_sub["expires_at"]) > now_ts:
+        new_expires = int(current_sub["expires_at"]) + PRO_DURATION_DAYS * 24 * 60 * 60
+    else:
+        new_expires = now_ts + PRO_DURATION_DAYS * 24 * 60 * 60
+
+    set_subscription(chat_id, PRO_PLAN_NAME, new_expires)
+
+    expire_date = datetime.fromtimestamp(new_expires).strftime("%d.%m.%Y %H:%M")
+
+    await update.message.reply_text(
+        f"🎉 PRO активирован!\n\n"
+        f"Действует до: {expire_date}\n"
+        f"Спасибо за поддержку бота ⭐"
+    )
+
+
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    user_id = update.effective_user.id
 
-    allowed, used, limit = check_daily_limit(chat_id, "image")
+    allowed, used, limit = check_daily_limit(chat_id, user_id, "image")
     if not allowed:
         await update.message.reply_text(
-            f"⚠️ Дневной лимит картинок исчерпан.\nСегодня использовано: {used}/{limit}."
+            f"⚠️ Дневной лимит картинок исчерпан.\nСегодня использовано: {used}/{limit}.\n\n"
+            f"Для большего лимита: /upgrade"
         )
         return
 
@@ -951,23 +1143,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     upsert_user(update)
 
-    wait_seconds = user_is_rate_limited(update.effective_user.id)
-    if wait_seconds is not None:
-        await update.message.reply_text(
-            f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
-        )
-        return
+    user_id = update.effective_user.id
+    chat_id = str(update.effective_chat.id)
+    user_text = update.message.text.strip()
+
+    if not is_admin(user_id):
+        wait_seconds = user_is_rate_limited(user_id)
+        if wait_seconds is not None:
+            await update.message.reply_text(
+                f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
+            )
+            return
 
     if await handle_buttons(update, context):
         return
 
-    chat_id = str(update.effective_chat.id)
-    user_text = update.message.text.strip()
-
     if not user_text:
         return
 
-    # Быстрые ответы без AI
     quick = quick_answer(chat_id, user_text)
     if quick:
         add_message(chat_id, "user", user_text)
@@ -975,10 +1168,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(quick, reply_markup=main_keyboard())
         return
 
-    allowed, used, limit = check_daily_limit(chat_id, "text")
+    allowed, used, limit = check_daily_limit(chat_id, user_id, "text")
     if not allowed:
         await update.message.reply_text(
-            f"⚠️ Дневной AI-лимит исчерпан.\nСегодня использовано: {used}/{limit}."
+            f"⚠️ Дневной AI-лимит исчерпан.\nСегодня использовано: {used}/{limit}.\n\n"
+            f"Для большего лимита: /upgrade"
         )
         return
 
@@ -1029,20 +1223,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     upsert_user(update)
 
-    wait_seconds = user_is_rate_limited(update.effective_user.id)
-    if wait_seconds is not None:
-        await update.message.reply_text(
-            f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
-        )
-        return
-
+    user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
     voice = update.message.voice
 
-    allowed, used, limit = check_daily_limit(chat_id, "voice")
+    if not is_admin(user_id):
+        wait_seconds = user_is_rate_limited(user_id)
+        if wait_seconds is not None:
+            await update.message.reply_text(
+                f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
+            )
+            return
+
+    allowed, used, limit = check_daily_limit(chat_id, user_id, "voice")
     if not allowed:
         await update.message.reply_text(
-            f"⚠️ Дневной лимит голосовых исчерпан.\nСегодня использовано: {used}/{limit}."
+            f"⚠️ Дневной лимит голосовых исчерпан.\nСегодня использовано: {used}/{limit}.\n\n"
+            f"Для большего лимита: /upgrade"
         )
         return
 
@@ -1168,22 +1365,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     upsert_user(update)
 
-    wait_seconds = user_is_rate_limited(update.effective_user.id)
-    if wait_seconds is not None:
-        await update.message.reply_text(
-            f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
-        )
-        return
-
+    user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
     doc = update.message.document
     filename = doc.file_name or "file"
     suffix = get_document_suffix(filename)
 
-    allowed, used, limit = check_daily_limit(chat_id, "file")
+    if not is_admin(user_id):
+        wait_seconds = user_is_rate_limited(user_id)
+        if wait_seconds is not None:
+            await update.message.reply_text(
+                f"⏳ Слишком быстро. Подожди {wait_seconds} сек. перед следующим сообщением."
+            )
+            return
+
+    allowed, used, limit = check_daily_limit(chat_id, user_id, "file")
     if not allowed:
         await update.message.reply_text(
-            f"⚠️ Дневной лимит файлов исчерпан.\nСегодня использовано: {used}/{limit}."
+            f"⚠️ Дневной лимит файлов исчерпан.\nСегодня использовано: {used}/{limit}.\n\n"
+            f"Для большего лимита: /upgrade"
         )
         return
 
@@ -1256,6 +1456,8 @@ ptb_app.add_handler(CommandHandler("me", me_command))
 ptb_app.add_handler(CommandHandler("remember", remember_command))
 ptb_app.add_handler(CommandHandler("mode", mode_command))
 ptb_app.add_handler(CommandHandler("image", image_command))
+ptb_app.add_handler(CommandHandler("upgrade", upgrade_command))
+ptb_app.add_handler(CommandHandler("pro", pro_command))
 
 ptb_app.add_handler(CommandHandler("admin", admin_command))
 ptb_app.add_handler(CommandHandler("stats", stats_command))
@@ -1265,6 +1467,8 @@ ptb_app.add_handler(CommandHandler("broadcast", broadcast_command))
 ptb_app.add_handler(CommandHandler("clear_db", clear_db_command))
 
 ptb_app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_"))
+ptb_app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+ptb_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
 ptb_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 ptb_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
