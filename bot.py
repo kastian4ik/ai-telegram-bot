@@ -53,9 +53,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-2.5-flash-lite")
-FILE_MODEL = os.getenv("FILE_MODEL", "gemini-2.5-flash-lite")
-VOICE_MODEL = os.getenv("VOICE_MODEL", "gemini-2.5-flash-lite")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gemini-2.0-flash")
+FILE_MODEL = os.getenv("FILE_MODEL", "gemini-2.0-flash")
+VOICE_MODEL = os.getenv("VOICE_MODEL", "gemini-2.0-flash")
 POLLINATIONS_IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "flux")
 
 SYSTEM_PROMPT = os.getenv(
@@ -299,6 +299,23 @@ def upsert_user(update: Update):
     conn.close()
 
 
+def ensure_user_exists(chat_id: str):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.execute("""
+        INSERT INTO users (chat_id, mode, memory_notes, created_at, updated_at)
+        VALUES (?, 'assistant', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (chat_id,))
+        conn.commit()
+
+    conn.close()
+
+
 def get_user(chat_id: str):
     conn = get_db()
     cur = conn.cursor()
@@ -309,6 +326,8 @@ def get_user(chat_id: str):
 
 
 def set_mode(chat_id: str, mode: str):
+    ensure_user_exists(chat_id)
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -323,12 +342,26 @@ def set_mode(chat_id: str, mode: str):
 def add_memory_note(chat_id: str, note: str):
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("SELECT memory_notes FROM users WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
 
-    old_notes = row["memory_notes"] if row and row["memory_notes"] else ""
+    if not row:
+        cur.execute("""
+        INSERT INTO users (chat_id, memory_notes, created_at, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (chat_id, f"- {note}"))
+        conn.commit()
+        conn.close()
+        return
+
+    old_notes = row["memory_notes"] if row["memory_notes"] else ""
     old_notes = old_notes.strip()
-    new_notes = (old_notes + "\n- " + note).strip() if old_notes else "- " + note
+
+    if old_notes:
+        new_notes = old_notes + f"\n- {note}"
+    else:
+        new_notes = f"- {note}"
 
     cur.execute("""
     UPDATE users
@@ -574,6 +607,7 @@ def mode_prompt(mode: str) -> str:
 
 
 def build_prompt(chat_id: str, user_text: str) -> str:
+    ensure_user_exists(chat_id)
     user = get_user(chat_id)
     history = get_recent_history(chat_id, MAX_HISTORY)
 
@@ -610,6 +644,8 @@ def build_prompt(chat_id: str, user_text: str) -> str:
 # QUICK ANSWERS WITHOUT AI
 # =========================
 def quick_answer(chat_id: str, user_text: str) -> str | None:
+    ensure_user_exists(chat_id)
+
     text = normalize_text(user_text)
     user = get_user(chat_id)
     memory_notes = user["memory_notes"] if user and user["memory_notes"] else ""
@@ -745,6 +781,9 @@ def admin_keyboard():
 # =========================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
+    chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     text = (
         "Привет! Я AI-бот.\n\n"
         "Умею:\n"
@@ -766,6 +805,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     await update.message.reply_text(
         "Просто пиши сообщения.\n\n"
         "/remember — сохранить факт о себе\n"
@@ -781,13 +824,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     clear_history(chat_id)
     await update.message.reply_text("История диалога очищена.", reply_markup=main_keyboard())
 
 
 async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     user = get_user(chat_id)
 
     if not user:
@@ -814,7 +863,10 @@ async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     text = " ".join(context.args).strip()
 
     if not text:
@@ -826,10 +878,11 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
     upsert_user(update)
+    chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
 
-    allowed = {"assistant", "coder", "translator", "teacher"}
+    allowed_modes = {"assistant", "coder", "translator", "teacher"}
 
     if not context.args:
         user = get_user(chat_id)
@@ -838,7 +891,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     new_mode = context.args[0].strip().lower()
-    if new_mode not in allowed:
+    if new_mode not in allowed_modes:
         await update.message.reply_text("Доступные режимы: assistant, coder, translator, teacher")
         return
 
@@ -847,7 +900,10 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     user_id = update.effective_user.id
 
     if is_admin(user_id):
@@ -872,6 +928,10 @@ async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def upgrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     prices = [LabeledPrice(f"PRO на {PRO_DURATION_DAYS} дней", PRO_PRICE_STARS)]
 
     await update.message.reply_invoice(
@@ -905,6 +965,7 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payment = update.message.successful_payment
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
 
     if payment.invoice_payload != "pro_30_days":
         return
@@ -931,6 +992,8 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update)
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     user_id = update.effective_user.id
 
     allowed, used, limit = check_daily_limit(chat_id, user_id, "image")
@@ -966,9 +1029,14 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN COMMANDS
 # =========================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Эта команда только для админа.")
         return
+
     await update.message.reply_text("Админ-панель:", reply_markup=admin_keyboard())
 
 
@@ -1100,6 +1168,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = update.message.text.strip()
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
 
     if text == "🧠 Новый чат":
         clear_history(chat_id)
@@ -1145,6 +1214,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     user_text = update.message.text.strip()
 
     if not is_admin(user_id):
@@ -1225,6 +1296,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     voice = update.message.voice
 
     if not is_admin(user_id):
@@ -1367,6 +1440,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = str(update.effective_chat.id)
+    ensure_user_exists(chat_id)
+
     doc = update.message.document
     filename = doc.file_name or "file"
     suffix = get_document_suffix(filename)
